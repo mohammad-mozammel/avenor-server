@@ -40,7 +40,7 @@ app.use(express.json());
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch((err) => {
     console.error(`[api] ${req.method} ${req.originalUrl}:`, err?.message);
-    res.status(500).send({ message: err?.message || "Server error" });
+    res.status(err?.statusCode || 500).send({ message: err?.message || "Server error" });
   });
 
 function createToken(user) {
@@ -87,18 +87,34 @@ const client = process.env.URI
     })
   : null;
 
-const dbReady = client
-  ? client
+/**
+ * Lazy, retryable connection. A failed connect must NOT be cached forever:
+ * on serverless cold starts a single transient failure would otherwise turn
+ * every request on that instance into "Database unavailable". On failure the
+ * promise is cleared so the next request retries.
+ */
+let connectPromise = null;
+function getConnectPromise() {
+  if (!connectPromise) {
+    if (!client) {
+      return Promise.reject(
+        Object.assign(new Error("Server not configured: missing URI env var"), { statusCode: 503 })
+      );
+    }
+    connectPromise = client
       .connect()
       .then(() => console.log("Pinged your deployment. You successfully connected to MongoDB!"))
       .catch((err) => {
         console.error("MongoDB connection failed:", err?.message);
-        throw err;
-      })
-  : Promise.reject(new Error("Missing URI env var (MongoDB connection string)"));
+        connectPromise = null; // allow retry on next request
+        throw Object.assign(new Error("Database unavailable"), { statusCode: 503 });
+      });
+  }
+  return connectPromise;
+}
 
 // silence unhandled-rejection noise; handlers surface errors themselves
-dbReady.catch(() => {});
+getConnectPromise().catch(() => {});
 
 function cols() {
   const database = client.db("devdeive_course");
@@ -111,12 +127,7 @@ function cols() {
 
 /** Ensure DB is usable before a query; throw a clean error otherwise. */
 async function needDb() {
-  if (!client) throw Object.assign(new Error("Server not configured: missing URI env var"), { statusCode: 503 });
-  try {
-    await dbReady;
-  } catch {
-    throw Object.assign(new Error("Database unavailable"), { statusCode: 503 });
-  }
+  await getConnectPromise();
   return cols();
 }
 
