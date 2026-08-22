@@ -3,6 +3,8 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
+const sanitizeHtml = require("sanitize-html");
+const rateLimit = require("express-rate-limit");
 
 /* Stripe key comes ONLY from env vars — never hardcode secrets in source. */
 let stripe = null;
@@ -44,7 +46,9 @@ const wrap = (fn) => (req, res, next) =>
   });
 
 function createToken(user) {
-  return jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign({ email: user.email, role: user.role || "student" }, JWT_SECRET, {
+    expiresIn: "7d",
+  });
 }
 
 function verifyToken(req, res, next) {
@@ -58,9 +62,42 @@ function verifyToken(req, res, next) {
       return res.status(401).send({ message: "Unauthorized" });
     }
     req.user = decoded.email;
+    req.role = decoded.role || "student";
     next();
   });
 }
+
+const requireRole = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.role)) {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+  next();
+};
+
+/** Allow a route only for the token owner's own email (admins pass too). */
+const requireSelfOrAdmin = (req, res, next) => {
+  if (req.role !== "admin" && req.params.email !== req.user) {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+  next();
+};
+
+/** Strip dangerous tags from instructor-supplied rich text before storage. */
+const cleanDescription = (html) =>
+  sanitizeHtml(String(html || ""), {
+    allowedTags: [
+      "p", "strong", "em", "u", "s", "br", "ul", "ol", "li",
+      "h3", "h4", "blockquote", "a", "span",
+    ],
+    allowedAttributes: { a: ["href", "target", "rel"] },
+    transformTags: {
+      a: sanitizeHtml.simpleTransform("a", { rel: "noopener noreferrer nofollow" }),
+    },
+  });
+
+/** Rate limiters for abuse-sensitive endpoints. */
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+const paymentLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
 
 /** Safe ObjectId parse — invalid ids must 404, never throw. */
 const toObjectId = (id) => {
@@ -117,7 +154,7 @@ function getConnectPromise() {
 getConnectPromise().catch(() => {});
 
 function cols() {
-  const database = client.db("devdeive_course");
+  const database = client.db(process.env.DB_NAME || "devdeive_course");
   return {
     course: database.collection("course"),
     user: database.collection("user"),
@@ -155,8 +192,17 @@ app.post(
   "/course/add",
   verifyToken,
   wrap(async (req, res) => {
-    const { course } = await needDb();
-    res.send(await course.insertOne(req.body));
+    const { user, course } = await needDb();
+    const doc = { ...req.body };
+    delete doc.role; // never trust client-supplied roles
+    doc.description = cleanDescription(doc.description);
+    doc.authorEmail = req.user; // ownership is derived from the token
+    res.send(await course.insertOne(doc));
+    /* Open-teaching policy: publishing a course promotes the author to instructor */
+    await user.updateOne(
+      { email: req.user, role: { $in: [null, "student"] } },
+      { $set: { role: "instructor" } }
+    );
   })
 );
 
@@ -167,6 +213,11 @@ app.delete(
     const _id = toObjectId(req.params.id);
     if (!_id) return res.status(404).send({ deletedCount: 0 });
     const { course } = await needDb();
+    const target = await course.findOne({ _id }, { projection: { authorEmail: 1 } });
+    if (!target) return res.status(404).send({ deletedCount: 0 });
+    if (req.role !== "admin" && target.authorEmail !== req.user) {
+      return res.status(403).send({ message: "You can only delete your own courses" });
+    }
     res.send(await course.deleteOne({ _id }));
   })
 );
@@ -178,60 +229,123 @@ app.patch(
     const _id = toObjectId(req.params.id);
     if (!_id) return res.status(404).send({ matchedCount: 0 });
     const { course } = await needDb();
-    res.send(await course.updateOne({ _id }, { $set: req.body }));
+    const target = await course.findOne({ _id }, { projection: { authorEmail: 1 } });
+    if (!target) return res.status(404).send({ matchedCount: 0 });
+    if (req.role !== "admin" && target.authorEmail !== req.user) {
+      return res.status(403).send({ message: "You can only edit your own courses" });
+    }
+    const updates = { ...req.body };
+    delete updates.role;
+    if ("description" in updates) updates.description = cleanDescription(updates.description);
+    res.send(await course.updateOne({ _id }, { $set: updates }));
   })
 );
 
 app.get(
   "/course/find/:email",
+  verifyToken,
+  requireSelfOrAdmin,
   wrap(async (req, res) => {
     const { course } = await needDb();
     res.send(await course.find({ authorEmail: req.params.email }).toArray());
   })
 );
 
+/**
+ * Access gate for the watching page: enrolled via payment record, the course
+ * author, an admin, or a free course. Everything else must pay first.
+ */
+app.get(
+  "/course/access/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    const _id = toObjectId(req.params.id);
+    if (!_id) return res.status(404).send({ allowed: false });
+    const { course, payment } = await needDb();
+    const target = await course.findOne(
+      { _id },
+      { projection: { price: 1, authorEmail: 1 } }
+    );
+    if (!target) return res.status(404).send({ allowed: false });
+    const free = !target.price || Number(target.price) <= 0;
+    const owns = target.authorEmail === req.user || req.role === "admin";
+    const paid =
+      (await payment.findOne(
+        { courseId: req.params.id, customerEmail: req.user },
+        { projection: { _id: 1 } }
+      )) !== null;
+    res.send({ allowed: free || owns || paid });
+  })
+);
+
 // ---------------- user ----------------
 
+/** Admin-only: full user roster. */
 app.get(
   "/user",
+  verifyToken,
+  requireRole("admin"),
   wrap(async (req, res) => {
     const { user } = await needDb();
-    res.send(await user.find().toArray());
+    res.send(
+      await user
+        .find({}, { projection: { progress: 0 } })
+        .toArray()
+    );
+  })
+);
+
+/** Token-scoped profile: the safe replacement for public /user/:email reads. */
+app.get(
+  "/users/me",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user } = await needDb();
+    res.send(await user.findOne({ email: req.user }, { projection: { progress: 0 } }));
   })
 );
 
 app.post(
   "/user",
+  loginLimiter,
   wrap(async (req, res) => {
     const { user } = await needDb();
-    const data = req.body;
-    const token = createToken(data);
+    const data = { ...req.body };
+    delete data.role; // roles are server-assigned only
     const itUserExist = await user.findOne({ email: data?.email });
     if (itUserExist?._id) {
-      return res.send({ token });
+      return res.send({ token: createToken(itUserExist) });
     }
-    await user.insertOne(data);
-    res.send({ token });
+    const inserted = await user.insertOne({ ...data, role: "student" });
+    res.send({
+      token: createToken({ email: data.email, role: "student", _id: inserted.insertedId }),
+    });
   })
 );
 
 app.get(
   "/user/:email",
+  verifyToken,
+  requireSelfOrAdmin,
   wrap(async (req, res) => {
     const { user } = await needDb();
-    res.send(await user.findOne({ email: req.params.email }));
+    res.send(await user.findOne({ email: req.params.email }, { projection: { progress: 0 } }));
   })
 );
 
 app.patch(
   "/user/:email",
   verifyToken,
+  requireSelfOrAdmin,
   wrap(async (req, res) => {
     const { user } = await needDb();
+    const updates = { ...req.body };
+    delete updates.role; // role changes require an admin route
+    delete updates.enrolledCourses; // enrollment is derived from payments
     res.send(
       await user.updateOne(
         { email: req.params.email },
-        { $set: req.body },
+        { $set: updates },
         { upsert: true }
       )
     );
@@ -240,16 +354,34 @@ app.patch(
 
 // ---------------- payment ----------------
 
+/** Admin-only ledger. Regular users use /payments/me. */
 app.get(
   "/payment",
+  verifyToken,
+  requireRole("admin"),
   wrap(async (req, res) => {
     const { payment } = await needDb();
     res.send(await payment.find().toArray());
   })
 );
 
+/** Token-scoped orders: purchases + sales belonging to the caller. */
+app.get(
+  "/payments/me",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { payment } = await needDb();
+    res.send(
+      await payment
+        .find({ $or: [{ customerEmail: req.user }, { authorEmail: req.user }] })
+        .toArray()
+    );
+  })
+);
+
 app.post(
   "/create-payment-intent",
+  paymentLimiter,
   wrap(async (req, res) => {
     if (!stripe) {
       return res.status(502).send({
@@ -285,29 +417,30 @@ app.post(
 
 app.post(
   "/payment",
+  verifyToken,
   wrap(async (req, res) => {
     const { payment, course, user } = await needDb();
-    const data = req.body;
+    const data = { ...req.body };
+    /* The buyer is always the token owner — never trust the client body. */
+    data.customerEmail = req.user;
     const result = await payment.insertOne(data);
 
     const _id = toObjectId(data.courseId);
     if (_id) {
       const paidCourse = await course.findOne({ _id });
+      if (!paidCourse) return res.send(result);
       const enrolledTotal = (paidCourse?.enrolled || 0) + 1;
       await course.updateOne({ _id }, { $set: { enrolled: enrolledTotal } });
 
-      const customer = await user.findOne({ email: data.customerEmail });
+      const customer = await user.findOne({ email: req.user });
       const enrolledCourses = Array.isArray(customer?.enrolledCourses)
         ? customer.enrolledCourses
         : [];
-      if (
-        paidCourse &&
-        !enrolledCourses.some((c) => c?._id === data.courseId)
-      ) {
+      if (!enrolledCourses.some((c) => c?._id === data.courseId)) {
         enrolledCourses.push(paidCourse);
       }
       await user.updateOne(
-        { email: data.customerEmail },
+        { email: req.user },
         { $set: { enrolledCourses } },
         { upsert: true }
       );
@@ -323,6 +456,7 @@ app.post(
 app.get(
   "/progress/:email",
   verifyToken,
+  requireSelfOrAdmin,
   wrap(async (req, res) => {
     const { user } = await needDb();
     const result = await user.findOne(
@@ -336,6 +470,7 @@ app.get(
 app.patch(
   "/progress/:email",
   verifyToken,
+  requireSelfOrAdmin,
   wrap(async (req, res) => {
     const { courseId, lessons } = req.body || {};
     if (!courseId || !Array.isArray(lessons)) {
