@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Text Animation Example</title>
+  </head>
+  <body>
+    <style>
+  body {
+  font-family: monospace;
+  font-size: 20px;
+  line-height: 1.5;
+  color: #00ff00;
+  background-color: #000;
+  
+}
+.lead{
+  text-shadow: 0 0 8px #00ff00;
+}
+    </style>
+   <p id="terminal-animation" class="lead">devdrive@server:$ </p>
+   <script>
+  window.onload = function() {
+    const element = document.querySelector("#terminal-animation");
+    const finalText = "Server running ...";
+    terminalType(0, element, finalText);
+};
+
+function terminalType(count, element, finalText) {
+    if (count < finalText.length) {
+        element.innerHTML += finalText.charAt(count);
+        count++;
+        setTimeout(function() {
+            terminalType(count, element, finalText);
+        }, 50);
+    }
+}
+
+  </script>
+  </body>
+</html>
