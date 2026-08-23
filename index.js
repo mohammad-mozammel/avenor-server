@@ -1154,25 +1154,56 @@ app.get(
   })
 );
 
+/** Student switches to an instructor account; returns a fresh token. */
+app.post(
+  "/users/me/teach",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user } = await needDb();
+    const me = await user.findOne(
+      { email: req.user },
+      { projection: { role: 1, banned: 1 } }
+    );
+    if (!me || me.banned) {
+      return res.status(403).send({ message: "Account unavailable" });
+    }
+    const role = me.role === "admin" ? "admin" : "instructor";
+    if (me.role !== role) {
+      await user.updateOne({ email: req.user }, { $set: { role } });
+    }
+    res.send({ token: createToken({ email: req.user, role }) });
+  })
+);
+
 app.post(
   "/user",
   loginLimiter,
   wrap(async (req, res) => {
     const { user } = await needDb();
     const data = { ...req.body };
-    delete data.role; // roles are server-assigned only
+    /* only an instructor request is honored; admins are env-assigned */
+    const wantsTeaching = data.role === "instructor";
+    delete data.role;
     const itUserExist = await user.findOne({ email: data?.email });
     if (itUserExist?._id) {
       if (itUserExist.banned) {
         return res.status(403).send({ message: "This account has been suspended." });
       }
-        if (ADMIN_EMAILS.includes(String(data.email).toLowerCase()) && itUserExist.role !== "admin") {
-        await user.updateOne({ email: data.email }, { $set: { role: "admin" } });
-        itUserExist.role = "admin";
+      let role = itUserExist.role || "student";
+      if (ADMIN_EMAILS.includes(String(data.email).toLowerCase())) {
+        if (role !== "admin") {
+          await user.updateOne({ email: data.email }, { $set: { role: "admin" } });
+          role = "admin";
+        }
+      } else if (wantsTeaching && role === "student") {
+        await user.updateOne({ email: data.email }, { $set: { role: "instructor" } });
+        role = "instructor";
       }
+      itUserExist.role = role;
       return res.send({ token: createToken(itUserExist) });
     }
-    const role = ADMIN_EMAILS.includes(String(data.email).toLowerCase()) ? "admin" : "student";
+    const isAdminEmail = ADMIN_EMAILS.includes(String(data.email || "").toLowerCase());
+    const role = isAdminEmail ? "admin" : wantsTeaching ? "instructor" : "student";
     const inserted = await user.insertOne({ ...data, role });
     res.send({
       token: createToken({ email: data.email, role, _id: inserted.insertedId }),
