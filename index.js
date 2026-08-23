@@ -1502,8 +1502,13 @@ app.patch(
 app.get(
   "/sitemap.xml",
   wrap(async (req, res) => {
+    /* Prefer a public origin from CLIENT_URL; never emit localhost. */
+    const candidates = (process.env.CLIENT_URL || "")
+      .split(",")
+      .map((o) => o.trim().replace(/\/+$/, ""))
+      .filter(Boolean);
     const origin =
-      (process.env.CLIENT_URL || "").split(",")[0]?.trim().replace(/\/+$/, "") ||
+      candidates.find((o) => /^https:\/\//.test(o) && !/localhost|127\.0\.0\.1/.test(o)) ||
       `${req.protocol}://${req.get("host")}`;
     let courseUrls = "";
     try {
