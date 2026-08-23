@@ -16,6 +16,13 @@ if (process.env.STRIPE_SECRET_KEY) {
 const app = express();
 const port = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
+/** Server-controlled admins: comma-separated emails in ADMIN_EMAILS. */
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+/** Instructor revenue share (0.7 = 70/30 split with the platform). */
+const INSTRUCTOR_SHARE = Number(process.env.INSTRUCTOR_SHARE) > 0 ? Number(process.env.INSTRUCTOR_SHARE) : 0.7;
 
 /**
  * CORS whitelist from CLIENT_URL (comma-separated). Localhost dev ports are
@@ -193,6 +200,7 @@ function cols() {
     question: database.collection("question"),
     certificate: database.collection("certificate"),
     quizAttempt: database.collection("quizAttempt"),
+    coupon: database.collection("coupon"),
   };
 }
 
@@ -205,6 +213,16 @@ function lessonCount(doc) {
     return doc.milestoneList.filter((l) => l && (l.title || l.videoTitleOne)).length;
   }
   return Number(doc?.lessons) || 0;
+}
+
+/** Validate a coupon code against expiry/usage limits. */
+async function validateCoupon(couponCol, code) {
+  if (!code) return null;
+  const c = await couponCol.findOne({ code: String(code).toUpperCase() });
+  if (!c) return null;
+  if (c.expiresAt && new Date(c.expiresAt) < new Date()) return null;
+  if (c.maxUses && (c.usedCount || 0) >= c.maxUses) return null;
+  return c;
 }
 
 /** Ensure DB is usable before a query; throw a clean error otherwise. */
@@ -356,10 +374,9 @@ app.get(
       newest: { _id: -1 },
       popular: { enrolled: -1 },
       rating: { ratingAvg: -1, ratingCount: -1 },
-      featured: { enrolled: -1 },
+      featured: { featured: -1, enrolled: -1 },
     };
     const sort = sorts[req.query.sort] || sorts.featured;
-
     const [items, total] = await Promise.all([
       course.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).toArray(),
       course.countDocuments(filter),
@@ -913,6 +930,254 @@ app.patch(
   })
 );
 
+// ---------------- coupons ----------------
+
+/** Checkout calls this before creating the intent. */
+app.get(
+  "/coupons/validate/:code",
+  wrap(async (req, res) => {
+    const { coupon } = await needDb();
+    const c = await validateCoupon(coupon, req.params.code);
+    if (!c) return res.status(404).send({ valid: false, message: "Invalid or expired coupon" });
+    res.send({ valid: true, code: c.code, percentOff: c.percentOff });
+  })
+);
+
+// ---------------- admin ----------------
+
+app.get(
+  "/admin/stats",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const { course, payment, user } = await needDb();
+    const [users, courses, paidAgg] = await Promise.all([
+      user.countDocuments(),
+      course.countDocuments(),
+      payment
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              gross: { $sum: { $convert: { input: { $ifNull: ["$price", "0"] }, to: "double", onError: 0 } } },
+              instructorDue: { $sum: { $ifNull: ["$instructorShare", { $multiply: [{ $convert: { input: { $ifNull: ["$price", "0"] }, to: "double", onError: 0 } }, INSTRUCTOR_SHARE] }] } },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+    const latestUsers = await user
+      .find({}, { projection: { displayName: 1, email: 1, role: 1, banned: 1 } })
+      .sort({ _id: -1 })
+      .limit(5)
+      .toArray();
+    res.send({
+      users,
+      courses,
+      sales: paidAgg[0]?.count || 0,
+      grossRevenue: Math.round((paidAgg[0]?.gross || 0) * 100) / 100,
+      instructorDue: Math.round((paidAgg[0]?.instructorDue || 0) * 100) / 100,
+      platformRevenue:
+        Math.round(((paidAgg[0]?.gross || 0) - (paidAgg[0]?.instructorDue || 0)) * 100) / 100,
+      latestUsers,
+    });
+  })
+);
+
+app.get(
+  "/admin/users",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit, 10) || 20);
+    const filter = {};
+    if (req.query.q) {
+      const rx = new RegExp(req.query.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ email: rx }, { displayName: rx }];
+    }
+    const { user } = await needDb();
+    const [items, total] = await Promise.all([
+      user
+        .find(filter, {
+          projection: { email: 1, displayName: 1, photoURL: 1, role: 1, banned: 1 },
+        })
+        .sort({ _id: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+      user.countDocuments(filter),
+    ]);
+    res.send({ items, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
+  })
+);
+
+/** Role changes + ban/unban. Admins cannot demote or ban themselves. */
+app.patch(
+  "/admin/users/:email",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    if (req.params.email === req.user) {
+      return res.status(400).send({ message: "You cannot modify your own account here" });
+    }
+    const updates = {};
+    if (req.body?.role !== undefined) {
+      if (!["student", "instructor", "admin"].includes(req.body.role)) {
+        return res.status(400).send({ message: "Invalid role" });
+      }
+      updates.role = req.body.role;
+    }
+    if (req.body?.banned !== undefined) updates.banned = !!req.body.banned;
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).send({ message: "Nothing to update" });
+    }
+    const { user } = await needDb();
+    res.send(await user.updateOne({ email: req.params.email }, { $set: updates }));
+  })
+);
+
+/** Feature/unfeature any course (shows first under "Featured" sort). */
+app.patch(
+  "/admin/courses/:id/featured",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const { course } = await needDb();
+    const featured = !!req.body?.featured;
+    res.send(
+      await course.updateOne({ _id: toObjectId(req.params.id) }, { $set: { featured } })
+    );
+  })
+);
+
+app.get(
+  "/admin/coupons",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const { coupon } = await needDb();
+    res.send(await coupon.find().sort({ _id: -1 }).limit(100).toArray());
+  })
+);
+
+app.post(
+  "/admin/coupons",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const code = String(req.body?.code || "").toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+    const percentOff = Number(req.body?.percentOff);
+    if (!code || !Number.isFinite(percentOff) || percentOff < 1 || percentOff > 100) {
+      return res.status(400).send({ message: "Code and percentOff (1–100) required" });
+    }
+    const maxUses = Number(req.body?.maxUses);
+    const doc = {
+      code,
+      percentOff: Math.round(percentOff),
+      maxUses: Number.isFinite(maxUses) && maxUses > 0 ? maxUses : null,
+      expiresAt: req.body?.expiresAt ? new Date(req.body.expiresAt) : null,
+      usedCount: 0,
+    };
+    const { coupon } = await needDb();
+    const exists = await coupon.findOne({ code });
+    if (exists) return res.status(409).send({ message: "Coupon code already exists" });
+    const result = await coupon.insertOne(doc);
+    res.send({ acknowledged: true, insertedId: result.insertedId });
+  })
+);
+
+app.delete(
+  "/admin/coupons/:code",
+  verifyToken,
+  requireRole("admin"),
+  wrap(async (req, res) => {
+    const { coupon } = await needDb();
+    res.send(await coupon.deleteOne({ code: String(req.params.code).toUpperCase() }));
+  })
+);
+
+// ---------------- instructor analytics (self-scoped) ----------------
+
+app.get(
+  "/analytics/instructor",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { payment, course, review } = await needDb();
+
+    /* All sales of my courses */
+    const sales = await payment.find({ authorEmail: req.user }).toArray();
+    const revenue = sales.reduce(
+      (sum, s) =>
+        sum +
+        (Number(s.instructorShare) ||
+          (Number(s.price) || 0) * INSTRUCTOR_SHARE),
+      0
+    );
+
+    /* Per-course rollups from my published catalog */
+    const myCourses = await course
+      .find({ authorEmail: req.user }, { projection: { title: 1, enrolled: 1, price: 1, ratingAvg: 1, ratingCount: 1, featured: 1 } })
+      .toArray();
+
+    const byCourse = myCourses.map((c) => {
+      const mine = sales.filter((s) => s.courseId === c._id.toString());
+      const courseRevenue = mine.reduce(
+        (sum, s) =>
+          sum + (Number(s.instructorShare) || (Number(s.price) || 0) * INSTRUCTOR_SHARE),
+        0
+      );
+      return {
+        courseId: c._id,
+        title: c.title,
+        enrolled: c.enrolled || 0,
+        paidSales: mine.length,
+        revenue: Math.round(courseRevenue * 100) / 100,
+        ratingAvg: c.ratingAvg || 0,
+        ratingCount: c.ratingCount || 0,
+        featured: !!c.featured,
+        price: c.price || "0",
+      };
+    });
+
+    /* Recent reviews across my courses */
+    const ids = myCourses.map((c) => c._id.toString());
+    const recentReviews =
+      ids.length > 0
+        ? await review
+            .find({ courseId: { $in: ids } }, { projection: { email: 0 } })
+            .sort({ _id: -1 })
+            .limit(8)
+            .toArray()
+        : [];
+
+    /* Latest students (from verified sales records) */
+    const students = sales
+      .slice()
+      .sort((a, b) => new Date(b.createdAt || b._id.generatedAt || 0) - new Date(a.createdAt || a._id.generatedAt || 0))
+      .slice(0, 10)
+      .map((s) => ({
+        name: s.customerName || s.customerEmail,
+        title: s.title,
+        amount: s.finalPrice || s.price,
+        at: s.createdAt || null,
+      }));
+
+    res.send({
+      totals: {
+        revenue: Math.round(revenue * 100) / 100,
+        paidSales: sales.length,
+        enrolledTotal: byCourse.reduce((n, c) => n + c.enrolled, 0),
+        courses: myCourses.length,
+      },
+      byCourse,
+      recentReviews,
+      students,
+    });
+  })
+);
+
 // ---------------- user ----------------
 
 /** Admin-only: full user roster. */
@@ -949,11 +1214,20 @@ app.post(
     delete data.role; // roles are server-assigned only
     const itUserExist = await user.findOne({ email: data?.email });
     if (itUserExist?._id) {
+      if (itUserExist.banned) {
+        return res.status(403).send({ message: "This account has been suspended." });
+      }
+      /* Promote env-declared admins on login (also fixes the stored doc). */
+      if (ADMIN_EMAILS.includes(String(data.email).toLowerCase()) && itUserExist.role !== "admin") {
+        await user.updateOne({ email: data.email }, { $set: { role: "admin" } });
+        itUserExist.role = "admin";
+      }
       return res.send({ token: createToken(itUserExist) });
     }
-    const inserted = await user.insertOne({ ...data, role: "student" });
+    const role = ADMIN_EMAILS.includes(String(data.email).toLowerCase()) ? "admin" : "student";
+    const inserted = await user.insertOne({ ...data, role });
     res.send({
-      token: createToken({ email: data.email, role: "student", _id: inserted.insertedId }),
+      token: createToken({ email: data.email, role, _id: inserted.insertedId }),
     });
   })
 );
@@ -1024,18 +1298,47 @@ app.post(
           "Payment gateway is not configured (missing STRIPE_SECRET_KEY).",
       });
     }
-    const price = Number(req.body?.price);
-    if (!Number.isFinite(price) || price <= 0) {
+
+    /* Price ALWAYS comes from the course doc — the client cannot name its own. */
+    let courseDoc = null;
+    const courseId = req.body?.courseId;
+    if (courseId) {
+      const { course } = await needDb();
+      courseDoc = await course.findOne(
+        { _id: toObjectId(courseId) },
+        { projection: { price: 1 } }
+      );
+      if (!courseDoc) return res.status(404).send({ message: "Course not found" });
+    }
+    const basePrice = courseDoc
+      ? Number(courseDoc.price) || 0
+      : Number(req.body?.price);
+    if (!Number.isFinite(basePrice) || basePrice <= 0) {
       return res.status(400).send({ message: "Invalid price" });
     }
+
+    /* Coupon (optional) */
+    const { coupon: couponCol } = await needDb();
+    const coupon = await validateCoupon(couponCol, req.body?.couponCode);
+    const percentOff = coupon ? Math.min(100, Math.max(1, Number(coupon.percentOff) || 0)) : 0;
+    const finalPrice = Math.max(0, basePrice * (1 - percentOff / 100));
+
     try {
-      const amount = Math.round(price * 100);
+      const amount = Math.max(50, Math.round(finalPrice * 100)); // Stripe minimum 50¢
       const paymentIntent = await stripe.paymentIntents.create({
         amount,
         currency: "usd",
         payment_method_types: ["card"],
+        metadata: { courseId: String(courseId || ""), couponCode: coupon?.code || "" },
       });
-      res.send({ clientSecret: paymentIntent.client_secret });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+        originalPrice: basePrice,
+        finalPrice: amount / 100,
+        discount: percentOff,
+        couponCode: coupon?.code || null,
+        intentAmount: amount,
+      });
     } catch (stripeErr) {
       console.error("[stripe] create-payment-intent:", stripeErr.message);
       res
@@ -1054,11 +1357,53 @@ app.post(
   "/payment",
   verifyToken,
   wrap(async (req, res) => {
-    const { payment, course, user } = await needDb();
+    const { payment, course, user, coupon: couponCol } = await needDb();
     const data = { ...req.body };
     /* The buyer is always the token owner — never trust the client body. */
     data.customerEmail = req.user;
+
+    /* Server-side price truth + Stripe intent verification. */
+    let basePrice = Number(data.price) || 0;
+    const courseDoc = data.courseId
+      ? await course.findOne({ _id: toObjectId(data.courseId) }, { projection: { price: 1 } })
+      : null;
+    if (courseDoc) basePrice = Number(courseDoc.price) || basePrice;
+
+    const coupon = await validateCoupon(couponCol, data.couponCode);
+    const percentOff = coupon ? Math.min(100, Math.max(1, Number(coupon.percentOff) || 0)) : 0;
+    const expectedFinal = basePrice * (1 - percentOff / 100);
+
+    if (stripe && data.transactionId) {
+      try {
+        const intent = await stripe.paymentIntents.retrieve(data.transactionId);
+        if (intent.status !== "succeeded") {
+          return res.status(402).send({ message: "Payment not completed" });
+        }
+        /* Amount must match what the course + coupon actually cost. */
+        if (Math.abs(intent.amount - Math.round(expectedFinal * 100)) > 1) {
+          return res.status(402).send({ message: "Payment amount mismatch" });
+        }
+      } catch (err) {
+        console.error("[stripe] intent verification failed:", err.message);
+        return res.status(402).send({ message: "Could not verify payment" });
+      }
+    }
+
+    /* Revenue split recorded at sale time. */
+    data.finalPrice = Math.round(expectedFinal * 100) / 100;
+    data.discount = percentOff;
+    data.instructorShare = Math.round(expectedFinal * INSTRUCTOR_SHARE * 100) / 100;
+    data.platformFee = Math.round((expectedFinal - data.instructorShare) * 100) / 100;
+
     const result = await payment.insertOne(data);
+
+    /* Burn one use of the coupon on a successful verified sale. */
+    if (coupon) {
+      await couponCol.updateOne(
+        { _id: coupon._id },
+        { $inc: { usedCount: 1 } }
+      );
+    }
 
     const _id = toObjectId(data.courseId);
     if (_id) {
