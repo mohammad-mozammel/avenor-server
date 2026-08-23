@@ -1497,6 +1497,39 @@ app.patch(
 
 // ---------------- misc ----------------
 
+/** Sitemap for search engines: static pages + every public course URL.
+ *  Origin comes from the first entry of CLIENT_URL. */
+app.get(
+  "/sitemap.xml",
+  wrap(async (req, res) => {
+    const origin =
+      (process.env.CLIENT_URL || "").split(",")[0]?.trim().replace(/\/+$/, "") ||
+      `${req.protocol}://${req.get("host")}`;
+    let courseUrls = "";
+    try {
+      const { course } = await needDb();
+      const docs = await course
+        .find({}, { projection: { _id: 1 } })
+        .sort({ _id: -1 })
+        .limit(2000)
+        .toArray();
+      courseUrls = docs
+        .map((d) => `  <url><loc>${origin}/courses/${d._id}</loc></url>`)
+        .join("\n");
+    } catch {
+      /* DB down → still emit static entries */
+    }
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>${origin}/</loc></url>
+  <url><loc>${origin}/courses</loc></url>
+  <url><loc>${origin}/contact</loc></url>
+${courseUrls}
+</urlset>`;
+    res.set("Content-Type", "application/xml").send(xml);
+  })
+);
+
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "avenor-server" });
 });
