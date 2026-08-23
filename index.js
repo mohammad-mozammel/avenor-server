@@ -5,6 +5,7 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const sanitizeHtml = require("sanitize-html");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 
 /* Stripe key comes ONLY from env vars — never hardcode secrets in source. */
 let stripe = null;
@@ -188,7 +189,22 @@ function cols() {
     user: database.collection("user"),
     payment: database.collection("payment"),
     review: database.collection("review"),
+    quiz: database.collection("quiz"),
+    question: database.collection("question"),
+    certificate: database.collection("certificate"),
+    quizAttempt: database.collection("quizAttempt"),
   };
+}
+
+/** Total lesson count across the sections[] / legacy shapes. */
+function lessonCount(doc) {
+  if (Array.isArray(doc?.sections) && doc.sections.length > 0) {
+    return doc.sections.reduce((n, s) => n + (s.lessons?.length || 0), 0);
+  }
+  if (Array.isArray(doc?.milestoneList)) {
+    return doc.milestoneList.filter((l) => l && (l.title || l.videoTitleOne)).length;
+  }
+  return Number(doc?.lessons) || 0;
 }
 
 /** Ensure DB is usable before a query; throw a clean error otherwise. */
@@ -522,6 +538,378 @@ app.get(
     const { user } = await needDb();
     const me = await user.findOne({ email: req.user }, { projection: { wishlist: 1 } });
     res.send({ wishlist: me?.wishlist || [] });
+  })
+);
+
+// ---------------- enrollment helper (shared by quiz/certificate/question gates) ----------------
+
+/** True when the token owner may consume this course's content: paid, free,
+ *  author or admin. */
+async function canLearn(courseCol, paymentCol, courseDoc, email, role) {
+  if (!courseDoc) return false;
+  if (role === "admin" || courseDoc.authorEmail === email) return true;
+  const price = Number(courseDoc.price);
+  if (!price || price <= 0) return true;
+  return (
+    (await paymentCol.findOne(
+      { courseId: courseDoc._id.toString(), customerEmail: email },
+      { projection: { _id: 1 } }
+    )) !== null
+  );
+}
+
+// ---------------- quizzes (per-course MCQ exam) ----------------
+
+const sanitizeQuiz = (body) => {
+  const qs = Array.isArray(body?.questions) ? body.questions.slice(0, 20) : [];
+  return {
+    questions: qs
+      .map((q) => {
+        const options = (Array.isArray(q?.options) ? q.options : [])
+          .slice(0, 6)
+          .map((o) => String(o || "").slice(0, 200));
+        const answerIdx = Number(q?.answerIdx);
+        return options.length >= 2 && Number.isInteger(answerIdx) && answerIdx >= 0 && answerIdx < options.length && String(q?.q || "").trim()
+          ? { q: String(q.q).slice(0, 400), options, answerIdx }
+          : null;
+      })
+      .filter(Boolean),
+    passScore: Math.min(100, Math.max(1, Number(body?.passScore) || 70)),
+  };
+};
+
+/** Author/admin full view; learners get answers stripped. */
+app.get(
+  "/quiz/:courseId",
+  wrap(async (req, res) => {
+    const { quiz } = await needDb();
+    const doc = await quiz.findOne({ courseId: req.params.courseId });
+    if (!doc) return res.send(null);
+
+    const authHeader = req.headers.authorization;
+    let isOwner = false;
+    let email = null;
+    let role = "student";
+    if (authHeader?.startsWith("Bearer ")) {
+      try {
+        const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+        email = decoded.email;
+        role = decoded.role || "student";
+        const { course } = await needDb();
+        const target = await course.findOne(
+          { _id: toObjectId(req.params.courseId) },
+          { projection: { authorEmail: 1 } }
+        );
+        isOwner = !!target && (target.authorEmail === email || role === "admin");
+      } catch {
+        /* anonymous */
+      }
+    }
+
+    const payload = { courseId: doc.courseId, passScore: doc.passScore, questions: doc.questions };
+    if (!isOwner) {
+      // strip the answer key from learner copies
+      payload.questions = doc.questions.map(({ q, options }) => ({ q, options }));
+    }
+    res.send(payload);
+  })
+);
+
+app.put(
+  "/quiz/:courseId",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { course, quiz } = await needDb();
+    const target = await course.findOne(
+      { _id: toObjectId(req.params.courseId) },
+      { projection: { authorEmail: 1 } }
+    );
+    if (!target) return res.status(404).send({ message: "Course not found" });
+    if (req.role !== "admin" && target.authorEmail !== req.user) {
+      return res.status(403).send({ message: "You can only manage your own course quiz" });
+    }
+    const clean = sanitizeQuiz(req.body);
+    if (clean.questions.length === 0) {
+      // empty payload = remove the quiz entirely
+      await quiz.deleteOne({ courseId: req.params.courseId });
+      return res.send({ removed: true });
+    }
+    await quiz.updateOne(
+      { courseId: req.params.courseId },
+      { $set: { ...clean, updatedAt: new Date() }, $setOnInsert: { courseId: req.params.courseId } },
+      { upsert: true }
+    );
+    res.send({ acknowledged: true, count: clean.questions.length });
+  })
+);
+
+/** Grade server-side; never trust client scores. */
+app.post(
+  "/quiz/:courseId/attempt",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { course, quiz, payment, quizAttempt } = await needDb();
+    const target = await course.findOne({ _id: toObjectId(req.params.courseId) });
+    if (!target) return res.status(404).send({ message: "Course not found" });
+
+    const allowed = await canLearn(course, payment, target, req.user, req.role);
+    if (!allowed) return res.status(403).send({ message: "Enroll first" });
+
+    const doc = await quiz.findOne({ courseId: req.params.courseId });
+    if (!doc) return res.status(404).send({ message: "No quiz for this course" });
+
+    const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
+    let correct = 0;
+    const review = doc.questions.map((q, i) => {
+      const given = Number(answers[i]);
+      const right = given === q.answerIdx;
+      if (right) correct++;
+      return {
+        q: q.q,
+        options: q.options,
+        chosen: Number.isInteger(given) ? given : -1,
+        answerIdx: q.answerIdx,
+        correct: right,
+      };
+    });
+    const total = doc.questions.length;
+    const score = total > 0 ? Math.round((correct / total) * 100) : 0;
+    const passed = score >= doc.passScore;
+
+    await quizAttempt.insertOne({
+      courseId: req.params.courseId,
+      email: req.user,
+      score,
+      correct,
+      total,
+      passed,
+      at: new Date(),
+    });
+
+    res.send({ score, correct, total, passed, passScore: doc.passScore, review });
+  })
+);
+
+/** Best/latest attempt summary for certificate gating + UI badges. */
+app.get(
+  "/quiz/:courseId/attempts/me",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { quizAttempt } = await needDb();
+    const latest = await quizAttempt
+      .find({ courseId: req.params.courseId, email: req.user })
+      .sort({ at: -1 })
+      .limit(1)
+      .toArray();
+    res.send(latest[0] || null);
+  })
+);
+
+// ---------------- certificates ----------------
+
+const certCode = () =>
+  "AVN-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+
+app.post(
+  "/certificates/:courseId",
+  loginLimiter,
+  verifyToken,
+  wrap(async (req, res) => {
+    const { course, payment, quiz, quizAttempt, certificate, user: userCol } = await needDb();
+    const target = await course.findOne({ _id: toObjectId(req.params.courseId) });
+    if (!target) return res.status(404).send({ message: "Course not found" });
+
+    const allowed = await canLearn(course, payment, target, req.user, req.role);
+    if (!allowed) return res.status(403).send({ message: "Enroll and finish the course first" });
+
+    /* Eligibility 1: every lesson marked complete */
+    const learner = await userCol.findOne({ email: req.user }, { projection: { displayName: 1, progress: 1 } });
+    const done = new Set(learner?.progress?.[req.params.courseId] || []);
+    const totalLessons = lessonCount(target);
+    if (totalLessons > 0 && done.size < totalLessons) {
+      return res.status(403).send({
+        message: `Finish all lessons first (${done.size}/${totalLessons})`,
+      });
+    }
+
+    /* Eligibility 2: pass the course quiz when one exists */
+    const hasQuiz = (await quiz.findOne({ courseId: req.params.courseId }, { projection: { _id: 1 } })) !== null;
+    if (hasQuiz) {
+      const attempt = await quizAttempt
+        .findOne({ courseId: req.params.courseId, email: req.user }, { sort: { at: -1 } });
+      if (!attempt || !attempt.passed) {
+        return res.status(403).send({ message: "Pass the course quiz to unlock your certificate" });
+      }
+    }
+
+    /* One certificate per learner/course — reuse the existing code */
+    const existing = await certificate.findOne({ courseId: req.params.courseId, email: req.user });
+    if (existing) return res.send(existing);
+
+    const doc = {
+      code: certCode(),
+      courseId: req.params.courseId,
+      email: req.user,
+      studentName: learner?.displayName || "Avenor Learner",
+      courseTitle: target.title,
+      authorName: target.author || "",
+      issuedAt: new Date(),
+    };
+    await certificate.insertOne(doc);
+    res.send(doc);
+  })
+);
+
+app.get(
+  "/certificates/mine",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { certificate } = await needDb();
+    res.send(await certificate.find({ email: req.user }).sort({ issuedAt: -1 }).toArray());
+  })
+);
+
+/** Public verification endpoint — no personal emails exposed. */
+app.get(
+  "/certificates/verify/:code",
+  wrap(async (req, res) => {
+    const { certificate } = await needDb();
+    const doc = await certificate.findOne(
+      { code: String(req.params.code || "").toUpperCase() },
+      { projection: { _id: 0, email: 0 } }
+    );
+    if (!doc) return res.status(404).send({ valid: false });
+    res.send({ valid: true, ...doc });
+  })
+);
+
+// ---------------- Q&A ----------------
+
+const plainText = (s) =>
+  sanitizeHtml(String(s || ""), { allowedTags: [], allowedAttributes: {} }).slice(0, 1500).trim();
+
+app.get(
+  "/questions/:courseId",
+  wrap(async (req, res) => {
+    const { question } = await needDb();
+    res.send(await question.find({ courseId: req.params.courseId }).sort({ createdAt: -1 }).limit(100).toArray());
+  })
+);
+
+app.post(
+  "/questions/:courseId",
+  verifyToken,
+  wrap(async (req, res) => {
+    const text = plainText(req.body?.text);
+    if (!text) return res.status(400).send({ message: "Question text required" });
+    const { course, payment, question } = await needDb();
+    const target = await course.findOne(
+      { _id: toObjectId(req.params.courseId) },
+      { projection: { price: 1, authorEmail: 1, author: 1 } }
+    );
+    if (!target) return res.status(404).send({ message: "Course not found" });
+    const allowed = await canLearn(course, payment, target, req.user, req.role);
+    if (!allowed) return res.status(403).send({ message: "Enroll to join the discussion" });
+
+    const lessonId = Number(req.body?.lessonId);
+    const result = await question.insertOne({
+      courseId: req.params.courseId,
+      lessonId: Number.isInteger(lessonId) && lessonId >= 0 ? lessonId : -1,
+      email: req.user,
+      name: req.body?.name || "Learner",
+      photo: req.body?.photo || "",
+      text,
+      isAuthor: target.authorEmail === req.user,
+      replies: [],
+      createdAt: new Date(),
+    });
+    res.send(result);
+  })
+);
+
+app.post(
+  "/questions/:questionId/reply",
+  verifyToken,
+  wrap(async (req, res) => {
+    const text = plainText(req.body?.text);
+    if (!text) return res.status(400).send({ message: "Reply text required" });
+    const { course, payment, question } = await needDb();
+    const q = await question.findOne(
+      { _id: toObjectId(req.params.questionId) },
+      { projection: { courseId: 1 } }
+    );
+    if (!q) return res.status(404).send({ message: "Question not found" });
+
+    const target = await course.findOne(
+      { _id: toObjectId(q.courseId) },
+      { projection: { price: 1, authorEmail: 1 } }
+    );
+    const allowed = target ? await canLearn(course, payment, target, req.user, req.role) : false;
+    if (!allowed) return res.status(403).send({ message: "Enroll to join the discussion" });
+
+    const isInstructor = !!target && target.authorEmail === req.user;
+    const result = await question.updateOne(
+      { _id: q._id },
+      {
+        $push: {
+          replies: {
+            name: req.body?.name || "Learner",
+            photo: req.body?.photo || "",
+            text,
+            isInstructor,
+            at: new Date(),
+          },
+        },
+      }
+    );
+    res.send(result);
+  })
+);
+
+app.delete(
+  "/questions/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { question } = await needDb();
+    const filter = { _id: toObjectId(req.params.id) };
+    if (!filter._id) return res.status(404).send({ deletedCount: 0 });
+    if (req.role !== "admin") filter.email = req.user;
+    res.send(await question.deleteOne(filter));
+  })
+);
+
+// ---------------- lesson notes (timestamped, on the user doc) ----------------
+
+app.get(
+  "/notes/:courseId",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user: userCol } = await needDb();
+    const me = await userCol.findOne(
+      { email: req.user },
+      { projection: { [`notes.${req.params.courseId}`]: 1 } }
+    );
+    res.send(me?.notes?.[req.params.courseId] || []);
+  })
+);
+
+app.patch(
+  "/notes/:courseId",
+  verifyToken,
+  wrap(async (req, res) => {
+    const raw = Array.isArray(req.body?.notes) ? req.body.notes.slice(0, 100) : [];
+    const notes = raw.map((n) => ({
+      lessonId: Math.max(0, Number(n?.lessonId) || 0),
+      at: Math.max(0, Math.floor(Number(n?.at) || 0)),
+      text: plainText(n?.text),
+    }));
+    const { user: userCol } = await needDb();
+    const result = await userCol.updateOne(
+      { email: req.user },
+      { $set: { [`notes.${req.params.courseId}`]: notes } },
+      { upsert: true }
+    );
+    res.send(result);
   })
 );
 
