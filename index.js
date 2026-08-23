@@ -95,6 +95,34 @@ const cleanDescription = (html) =>
     },
   });
 
+/**
+ * Normalize the multi-section curriculum payload: keep `sections` as the
+ * source of truth and mirror it into the legacy milestone/milestoneList
+ * fields so older views (progress %, cards) keep working unchanged.
+ */
+function withSections(doc) {
+  if (!Array.isArray(doc.sections)) return doc;
+  doc.sections = doc.sections
+    .map((s) => ({
+      title: String(s?.title || "").slice(0, 140),
+      lessons: (Array.isArray(s?.lessons) ? s.lessons : [])
+        .filter((l) => l && l.title)
+        .map((l) => ({
+          title: String(l.title).slice(0, 180),
+          videoUrl: String(l.videoUrl || ""),
+        })),
+    }))
+    .filter((s) => s.title || s.lessons.length > 0);
+
+  const flat = doc.sections.flatMap((s) => s.lessons);
+  if (flat.length > 0) {
+    doc.milestone = doc.sections[0]?.title || doc.milestone;
+    doc.milestoneList = flat.map((l) => ({ title: l.title, videUrl: l.videoUrl }));
+    doc.lessons = String(flat.length);
+  }
+  return doc;
+}
+
 /** Rate limiters for abuse-sensitive endpoints. */
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 const paymentLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
@@ -159,6 +187,7 @@ function cols() {
     course: database.collection("course"),
     user: database.collection("user"),
     payment: database.collection("payment"),
+    review: database.collection("review"),
   };
 }
 
@@ -197,6 +226,7 @@ app.post(
     delete doc.role; // never trust client-supplied roles
     doc.description = cleanDescription(doc.description);
     doc.authorEmail = req.user; // ownership is derived from the token
+    withSections(doc);
     res.send(await course.insertOne(doc));
     /* Open-teaching policy: publishing a course promotes the author to instructor */
     await user.updateOne(
@@ -237,6 +267,7 @@ app.patch(
     const updates = { ...req.body };
     delete updates.role;
     if ("description" in updates) updates.description = cleanDescription(updates.description);
+    withSections(updates);
     res.send(await course.updateOne({ _id }, { $set: updates }));
   })
 );
@@ -275,6 +306,222 @@ app.get(
         { projection: { _id: 1 } }
       )) !== null;
     res.send({ allowed: free || owns || paid });
+  })
+);
+
+// ---------------- catalog v2 (server-side search/filter/sort/pagination) ----------------
+
+app.get(
+  "/courses/search",
+  wrap(async (req, res) => {
+    const { course } = await needDb();
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(48, Math.max(1, parseInt(req.query.limit, 10) || 9));
+
+    const filter = {};
+    if (req.query.q) {
+      const rx = new RegExp(req.query.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ title: rx }, { author: rx }, { category: rx }];
+    }
+    if (req.query.category && req.query.category !== "All") {
+      filter.category = req.query.category;
+    }
+    if (req.query.level) filter.lave = req.query.level;
+    const maxPrice = Number(req.query.maxprice);
+    if (Number.isFinite(maxPrice) && maxPrice >= 0) {
+      /* $convert with onError survives messy legacy price values */
+      const toDouble = { $convert: { input: { $ifNull: ["$price", "0"] }, to: "double", onError: 0 } };
+      filter.$and = [...(filter.$and || []), { $expr: { $lte: [toDouble, maxPrice] } }];
+    }
+
+    const sorts = {
+      "price-asc": { price: 1 },
+      "price-desc": { price: -1 },
+      newest: { _id: -1 },
+      popular: { enrolled: -1 },
+      rating: { ratingAvg: -1, ratingCount: -1 },
+      featured: { enrolled: -1 },
+    };
+    const sort = sorts[req.query.sort] || sorts.featured;
+
+    const [items, total] = await Promise.all([
+      course.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).toArray(),
+      course.countDocuments(filter),
+    ]);
+
+    res.send({ items, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
+  })
+);
+
+/** Distinct categories for building filter chips without loading all docs.
+ *  (aggregation instead of .distinct() — not available under strict API v1) */
+app.get(
+  "/courses/categories",
+  wrap(async (req, res) => {
+    const { course } = await needDb();
+    const cats = await course
+      .aggregate([{ $match: { category: { $nin: [null, ""] } } }, { $group: { _id: "$category" } }, { $sort: { _id: 1 } }])
+      .toArray();
+    res.send(cats.map((c) => c._id));
+  })
+);
+
+// ---------------- reviews ----------------
+
+async function refreshCourseRating(reviewCol, courseCol, courseIdStr, _idObj) {
+  const [stats] = await reviewCol
+    .aggregate([
+      { $match: { courseId: courseIdStr } },
+      { $group: { _id: "$courseId", avg: { $avg: "$rating" }, count: { $sum: 1 } } },
+    ])
+    .toArray();
+  await courseCol.updateOne(
+    { _id: _idObj },
+    {
+      $set: {
+        ratingAvg: stats ? Math.round(stats.avg * 10) / 10 : 0,
+        ratingCount: stats ? stats.count : 0,
+      },
+    }
+  );
+}
+
+app.get(
+  "/course/reviews/:id",
+  wrap(async (req, res) => {
+    const { review } = await needDb();
+    const list = await review
+      .find({ courseId: req.params.id }, { projection: { email: 0 } })
+      .sort({ _id: -1 })
+      .toArray();
+
+    /* Mark the caller's own review (if any) so the UI can offer edit/delete */
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      try {
+        const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+        const mineId = (
+          await review.findOne(
+            { courseId: req.params.id, email: decoded.email },
+            { projection: { _id: 1 } }
+          )
+        )?._id?.toString();
+        if (mineId) {
+          for (const r of list) if (r._id.toString() === mineId) r.mine = true;
+        }
+      } catch {
+        /* invalid/expired token → no marker, list stays public */
+      }
+    }
+    res.send(list);
+  })
+);
+
+/** Enrolled-only, one review per user, editable by re-posting. */
+app.post(
+  "/course/reviews/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    const rating = Number(req.body?.rating);
+    const comment = String(req.body?.comment || "").slice(0, 1200);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      return res.status(400).send({ message: "Rating must be 1–5" });
+    }
+    const { course, payment, review } = await needDb();
+    const target = await course.findOne(
+      { _id: toObjectId(req.params.id) },
+      { projection: { price: 1, authorEmail: 1 } }
+    );
+    if (!target) return res.status(404).send({ message: "Course not found" });
+
+    const owns = target.authorEmail === req.user || req.role === "admin";
+    const paid =
+      (await payment.findOne(
+        { courseId: req.params.id, customerEmail: req.user },
+        { projection: { _id: 1 } }
+      )) !== null;
+    const free = !target.price || Number(target.price) <= 0;
+    if (!owns && !paid && !free) {
+      return res.status(403).send({ message: "Only enrolled learners can review" });
+    }
+
+    await review.updateOne(
+      { courseId: req.params.id, email: req.user },
+      {
+        $set: {
+          rating,
+          comment: cleanDescription(comment).replace(/<[^>]*>/g, ""), // plain text only
+          name: req.body?.name || "Learner",
+          photo: req.body?.photo || "",
+          updatedAt: new Date(),
+        },
+        $setOnInsert: { courseId: req.params.id, email: req.user, createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+    await refreshCourseRating(review, course, req.params.id, toObjectId(req.params.id));
+    res.send({ acknowledged: true });
+  })
+);
+
+app.delete(
+  "/course/reviews/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { course, review } = await needDb();
+    const result = await review.deleteOne({ courseId: req.params.id, email: req.user });
+    await refreshCourseRating(review, course, req.params.id, toObjectId(req.params.id));
+    res.send(result);
+  })
+);
+
+// ---------------- wishlist ----------------
+
+app.get(
+  "/wishlist",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user, course } = await needDb();
+    const me = await user.findOne({ email: req.user }, { projection: { wishlist: 1 } });
+    const ids = (me?.wishlist || [])
+      .map((cid) => toObjectId(cid))
+      .filter(Boolean);
+    if (!ids.length) return res.send([]);
+    res.send(await course.find({ _id: { $in: ids } }).toArray());
+  })
+);
+
+/** Toggle a course in the caller's wishlist. */
+app.post(
+  "/wishlist/:courseId",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user, course } = await needDb();
+    const cid = req.params.courseId;
+    if (!toObjectId(cid)) return res.status(404).send({ message: "Course not found" });
+    const exists = await course.findOne({ _id: toObjectId(cid) }, { projection: { _id: 1 } });
+    if (!exists) return res.status(404).send({ message: "Course not found" });
+
+    const me = await user.findOne({ email: req.user }, { projection: { wishlist: 1 } });
+    const current = Array.isArray(me?.wishlist) ? me.wishlist : [];
+    const wished = current.includes(cid);
+    await user.updateOne(
+      { email: req.user },
+      wished
+        ? { $pull: { wishlist: cid } }
+        : { $addToSet: { wishlist: cid } }
+    );
+    res.send({ wished: !wished });
+  })
+);
+
+app.get(
+  "/wishlist/statuses",
+  verifyToken,
+  wrap(async (req, res) => {
+    const { user } = await needDb();
+    const me = await user.findOne({ email: req.user }, { projection: { wishlist: 1 } });
+    res.send({ wishlist: me?.wishlist || [] });
   })
 );
 
@@ -467,21 +714,48 @@ app.get(
   })
 );
 
+/** Full learning state incl. resume positions + active lesson per course. */
+app.get(
+  "/progress/state/:email",
+  verifyToken,
+  requireSelfOrAdmin,
+  wrap(async (req, res) => {
+    const { user } = await needDb();
+    const result = await user.findOne(
+      { email: req.params.email },
+      { projection: { progress: 1, progressPositions: 1, lastLesson: 1 } }
+    );
+    res.send({
+      completed: result?.progress || {},
+      positions: result?.progressPositions || {},
+      lastLesson: result?.lastLesson || {},
+    });
+  })
+);
+
 app.patch(
   "/progress/:email",
   verifyToken,
   requireSelfOrAdmin,
   wrap(async (req, res) => {
-    const { courseId, lessons } = req.body || {};
+    const { courseId, lessons, positions, lastLesson } = req.body || {};
     if (!courseId || !Array.isArray(lessons)) {
       return res
         .status(400)
         .send({ message: "courseId and lessons[] required" });
     }
+    const set = { [`progress.${courseId}`]: lessons.map(String) };
+    /* Resume playback + autoplay-next support */
+    if (positions && typeof positions === "object" && !Array.isArray(positions)) {
+      set[`progressPositions.${courseId}`] = positions;
+    }
+    if (Number.isFinite(Number(lastLesson))) {
+      set[`lastLesson.${courseId}`] = Number(lastLesson);
+    }
     const { user } = await needDb();
     await user.updateOne(
       { email: req.params.email },
-      { $set: { [`progress.${courseId}`]: lessons.map(String) } },
+      { $set: set },
       { upsert: true }
     );
     res.send({ acknowledged: true });
