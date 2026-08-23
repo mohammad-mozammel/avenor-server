@@ -7,7 +7,6 @@ const sanitizeHtml = require("sanitize-html");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 
-/* Stripe key comes ONLY from env vars — never hardcode secrets in source. */
 let stripe = null;
 if (process.env.STRIPE_SECRET_KEY) {
   stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
@@ -16,18 +15,13 @@ if (process.env.STRIPE_SECRET_KEY) {
 const app = express();
 const port = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
-/** Server-controlled admins: comma-separated emails in ADMIN_EMAILS. */
+// admins come from env
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
-/** Instructor revenue share (0.7 = 70/30 split with the platform). */
 const INSTRUCTOR_SHARE = Number(process.env.INSTRUCTOR_SHARE) > 0 ? Number(process.env.INSTRUCTOR_SHARE) : 0.7;
 
-/**
- * CORS whitelist from CLIENT_URL (comma-separated). Localhost dev ports are
- * always allowed; anything else falls back open like before.
- */
 const allowedOrigins = (process.env.CLIENT_URL || "")
   .split(",")
   .map((o) => o.trim().replace(/https:https:/, "https:"))
@@ -42,11 +36,6 @@ app.use(
 );
 app.use(express.json());
 
-/**
- * Wrap async route handlers: without this, ANY rejected promise inside a
- * route (Stripe error, bad ObjectId, Mongo timeout...) becomes an unhandled
- * rejection that terminates Node >= 15 — killing the service (502 loops).
- */
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch((err) => {
     console.error(`[api] ${req.method} ${req.originalUrl}:`, err?.message);
@@ -82,7 +71,6 @@ const requireRole = (...roles) => (req, res, next) => {
   next();
 };
 
-/** Allow a route only for the token owner's own email (admins pass too). */
 const requireSelfOrAdmin = (req, res, next) => {
   if (req.role !== "admin" && req.params.email !== req.user) {
     return res.status(403).send({ message: "Forbidden" });
@@ -90,7 +78,7 @@ const requireSelfOrAdmin = (req, res, next) => {
   next();
 };
 
-/** Strip dangerous tags from instructor-supplied rich text before storage. */
+// rich text comes from instructors
 const cleanDescription = (html) =>
   sanitizeHtml(String(html || ""), {
     allowedTags: [
@@ -103,11 +91,6 @@ const cleanDescription = (html) =>
     },
   });
 
-/**
- * Normalize the multi-section curriculum payload: keep `sections` as the
- * source of truth and mirror it into the legacy milestone/milestoneList
- * fields so older views (progress %, cards) keep working unchanged.
- */
 function withSections(doc) {
   if (!Array.isArray(doc.sections)) return doc;
   doc.sections = doc.sections
@@ -131,11 +114,9 @@ function withSections(doc) {
   return doc;
 }
 
-/** Rate limiters for abuse-sensitive endpoints. */
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 const paymentLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
 
-/** Safe ObjectId parse — invalid ids must 404, never throw. */
 const toObjectId = (id) => {
   try {
     return new ObjectId(id);
@@ -144,12 +125,6 @@ const toObjectId = (id) => {
   }
 };
 
-/**
- * MongoDB: routes are registered IMMEDIATELY at module load so they exist
- * even on a serverless cold start. Handlers `await dbReady` before touching
- * collections. A missing/failed connection yields a clear 503 JSON response
- * instead of silently dead routes.
- */
 const client = process.env.URI
   ? new MongoClient(process.env.URI, {
       serverApi: {
@@ -160,12 +135,6 @@ const client = process.env.URI
     })
   : null;
 
-/**
- * Lazy, retryable connection. A failed connect must NOT be cached forever:
- * on serverless cold starts a single transient failure would otherwise turn
- * every request on that instance into "Database unavailable". On failure the
- * promise is cleared so the next request retries.
- */
 let connectPromise = null;
 function getConnectPromise() {
   if (!connectPromise) {
@@ -176,7 +145,19 @@ function getConnectPromise() {
     }
     connectPromise = client
       .connect()
-      .then(() => console.log("Pinged your deployment. You successfully connected to MongoDB!"))
+      .then(async () => {
+        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+        // hot-path indexes (safe to re-run, allSettled so a bad legacy doc can't block boot)
+        const { course, payment, review, user } = cols();
+        await Promise.allSettled([
+          course.createIndex({ category: 1 }),
+          course.createIndex({ featured: -1, enrolled: -1 }),
+          payment.createIndex({ customerEmail: 1 }),
+          payment.createIndex({ authorEmail: 1 }),
+          review.createIndex({ courseId: 1, email: 1 }, { unique: true }),
+          user.createIndex({ email: 1 }, { unique: true }),
+        ]);
+      })
       .catch((err) => {
         console.error("MongoDB connection failed:", err?.message);
         connectPromise = null; // allow retry on next request
@@ -186,7 +167,6 @@ function getConnectPromise() {
   return connectPromise;
 }
 
-// silence unhandled-rejection noise; handlers surface errors themselves
 getConnectPromise().catch(() => {});
 
 function cols() {
@@ -204,7 +184,6 @@ function cols() {
   };
 }
 
-/** Total lesson count across the sections[] / legacy shapes. */
 function lessonCount(doc) {
   if (Array.isArray(doc?.sections) && doc.sections.length > 0) {
     return doc.sections.reduce((n, s) => n + (s.lessons?.length || 0), 0);
@@ -215,7 +194,6 @@ function lessonCount(doc) {
   return Number(doc?.lessons) || 0;
 }
 
-/** Validate a coupon code against expiry/usage limits. */
 async function validateCoupon(couponCol, code) {
   if (!code) return null;
   const c = await couponCol.findOne({ code: String(code).toUpperCase() });
@@ -225,7 +203,6 @@ async function validateCoupon(couponCol, code) {
   return c;
 }
 
-/** Ensure DB is usable before a query; throw a clean error otherwise. */
 async function needDb() {
   await getConnectPromise();
   return cols();
@@ -262,7 +239,6 @@ app.post(
     doc.authorEmail = req.user; // ownership is derived from the token
     withSections(doc);
     res.send(await course.insertOne(doc));
-    /* Open-teaching policy: publishing a course promotes the author to instructor */
     await user.updateOne(
       { email: req.user, role: { $in: [null, "student"] } },
       { $set: { role: "instructor" } }
@@ -316,10 +292,6 @@ app.get(
   })
 );
 
-/**
- * Access gate for the watching page: enrolled via payment record, the course
- * author, an admin, or a free course. Everything else must pay first.
- */
 app.get(
   "/course/access/:id",
   verifyToken,
@@ -343,7 +315,7 @@ app.get(
   })
 );
 
-// ---------------- catalog v2 (server-side search/filter/sort/pagination) ----------------
+// catalog search
 
 app.get(
   "/courses/search",
@@ -386,8 +358,6 @@ app.get(
   })
 );
 
-/** Distinct categories for building filter chips without loading all docs.
- *  (aggregation instead of .distinct() — not available under strict API v1) */
 app.get(
   "/courses/categories",
   wrap(async (req, res) => {
@@ -428,7 +398,6 @@ app.get(
       .sort({ _id: -1 })
       .toArray();
 
-    /* Mark the caller's own review (if any) so the UI can offer edit/delete */
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith("Bearer ")) {
       try {
@@ -450,7 +419,6 @@ app.get(
   })
 );
 
-/** Enrolled-only, one review per user, editable by re-posting. */
 app.post(
   "/course/reviews/:id",
   verifyToken,
@@ -524,7 +492,6 @@ app.get(
   })
 );
 
-/** Toggle a course in the caller's wishlist. */
 app.post(
   "/wishlist/:courseId",
   verifyToken,
@@ -558,10 +525,8 @@ app.get(
   })
 );
 
-// ---------------- enrollment helper (shared by quiz/certificate/question gates) ----------------
 
-/** True when the token owner may consume this course's content: paid, free,
- *  author or admin. */
+
 async function canLearn(courseCol, paymentCol, courseDoc, email, role) {
   if (!courseDoc) return false;
   if (role === "admin" || courseDoc.authorEmail === email) return true;
@@ -575,7 +540,7 @@ async function canLearn(courseCol, paymentCol, courseDoc, email, role) {
   );
 }
 
-// ---------------- quizzes (per-course MCQ exam) ----------------
+// quizzes
 
 const sanitizeQuiz = (body) => {
   const qs = Array.isArray(body?.questions) ? body.questions.slice(0, 20) : [];
@@ -595,7 +560,6 @@ const sanitizeQuiz = (body) => {
   };
 };
 
-/** Author/admin full view; learners get answers stripped. */
 app.get(
   "/quiz/:courseId",
   wrap(async (req, res) => {
@@ -660,7 +624,6 @@ app.put(
   })
 );
 
-/** Grade server-side; never trust client scores. */
 app.post(
   "/quiz/:courseId/attempt",
   verifyToken,
@@ -707,7 +670,6 @@ app.post(
   })
 );
 
-/** Best/latest attempt summary for certificate gating + UI badges. */
 app.get(
   "/quiz/:courseId/attempts/me",
   verifyToken,
@@ -739,7 +701,6 @@ app.post(
     const allowed = await canLearn(course, payment, target, req.user, req.role);
     if (!allowed) return res.status(403).send({ message: "Enroll and finish the course first" });
 
-    /* Eligibility 1: every lesson marked complete */
     const learner = await userCol.findOne({ email: req.user }, { projection: { displayName: 1, progress: 1 } });
     const done = new Set(learner?.progress?.[req.params.courseId] || []);
     const totalLessons = lessonCount(target);
@@ -749,7 +710,6 @@ app.post(
       });
     }
 
-    /* Eligibility 2: pass the course quiz when one exists */
     const hasQuiz = (await quiz.findOne({ courseId: req.params.courseId }, { projection: { _id: 1 } })) !== null;
     if (hasQuiz) {
       const attempt = await quizAttempt
@@ -759,7 +719,6 @@ app.post(
       }
     }
 
-    /* One certificate per learner/course — reuse the existing code */
     const existing = await certificate.findOne({ courseId: req.params.courseId, email: req.user });
     if (existing) return res.send(existing);
 
@@ -786,7 +745,6 @@ app.get(
   })
 );
 
-/** Public verification endpoint — no personal emails exposed. */
 app.get(
   "/certificates/verify/:code",
   wrap(async (req, res) => {
@@ -895,7 +853,7 @@ app.delete(
   })
 );
 
-// ---------------- lesson notes (timestamped, on the user doc) ----------------
+// notes
 
 app.get(
   "/notes/:courseId",
@@ -932,7 +890,6 @@ app.patch(
 
 // ---------------- coupons ----------------
 
-/** Checkout calls this before creating the intent. */
 app.get(
   "/coupons/validate/:code",
   wrap(async (req, res) => {
@@ -1013,7 +970,6 @@ app.get(
   })
 );
 
-/** Role changes + ban/unban. Admins cannot demote or ban themselves. */
 app.patch(
   "/admin/users/:email",
   verifyToken,
@@ -1038,7 +994,6 @@ app.patch(
   })
 );
 
-/** Feature/unfeature any course (shows first under "Featured" sort). */
 app.patch(
   "/admin/courses/:id/featured",
   verifyToken,
@@ -1106,7 +1061,6 @@ app.get(
   wrap(async (req, res) => {
     const { payment, course, review } = await needDb();
 
-    /* All sales of my courses */
     const sales = await payment.find({ authorEmail: req.user }).toArray();
     const revenue = sales.reduce(
       (sum, s) =>
@@ -1116,7 +1070,6 @@ app.get(
       0
     );
 
-    /* Per-course rollups from my published catalog */
     const myCourses = await course
       .find({ authorEmail: req.user }, { projection: { title: 1, enrolled: 1, price: 1, ratingAvg: 1, ratingCount: 1, featured: 1 } })
       .toArray();
@@ -1141,7 +1094,6 @@ app.get(
       };
     });
 
-    /* Recent reviews across my courses */
     const ids = myCourses.map((c) => c._id.toString());
     const recentReviews =
       ids.length > 0
@@ -1152,7 +1104,6 @@ app.get(
             .toArray()
         : [];
 
-    /* Latest students (from verified sales records) */
     const students = sales
       .slice()
       .sort((a, b) => new Date(b.createdAt || b._id.generatedAt || 0) - new Date(a.createdAt || a._id.generatedAt || 0))
@@ -1180,7 +1131,6 @@ app.get(
 
 // ---------------- user ----------------
 
-/** Admin-only: full user roster. */
 app.get(
   "/user",
   verifyToken,
@@ -1195,7 +1145,6 @@ app.get(
   })
 );
 
-/** Token-scoped profile: the safe replacement for public /user/:email reads. */
 app.get(
   "/users/me",
   verifyToken,
@@ -1217,8 +1166,7 @@ app.post(
       if (itUserExist.banned) {
         return res.status(403).send({ message: "This account has been suspended." });
       }
-      /* Promote env-declared admins on login (also fixes the stored doc). */
-      if (ADMIN_EMAILS.includes(String(data.email).toLowerCase()) && itUserExist.role !== "admin") {
+        if (ADMIN_EMAILS.includes(String(data.email).toLowerCase()) && itUserExist.role !== "admin") {
         await user.updateOne({ email: data.email }, { $set: { role: "admin" } });
         itUserExist.role = "admin";
       }
@@ -1263,7 +1211,6 @@ app.patch(
 
 // ---------------- payment ----------------
 
-/** Admin-only ledger. Regular users use /payments/me. */
 app.get(
   "/payment",
   verifyToken,
@@ -1274,7 +1221,6 @@ app.get(
   })
 );
 
-/** Token-scoped orders: purchases + sales belonging to the caller. */
 app.get(
   "/payments/me",
   verifyToken,
@@ -1299,7 +1245,6 @@ app.post(
       });
     }
 
-    /* Price ALWAYS comes from the course doc — the client cannot name its own. */
     let courseDoc = null;
     const courseId = req.body?.courseId;
     if (courseId) {
@@ -1317,7 +1262,6 @@ app.post(
       return res.status(400).send({ message: "Invalid price" });
     }
 
-    /* Coupon (optional) */
     const { coupon: couponCol } = await needDb();
     const coupon = await validateCoupon(couponCol, req.body?.couponCode);
     const percentOff = coupon ? Math.min(100, Math.max(1, Number(coupon.percentOff) || 0)) : 0;
@@ -1359,10 +1303,8 @@ app.post(
   wrap(async (req, res) => {
     const { payment, course, user, coupon: couponCol } = await needDb();
     const data = { ...req.body };
-    /* The buyer is always the token owner — never trust the client body. */
     data.customerEmail = req.user;
 
-    /* Server-side price truth + Stripe intent verification. */
     let basePrice = Number(data.price) || 0;
     const courseDoc = data.courseId
       ? await course.findOne({ _id: toObjectId(data.courseId) }, { projection: { price: 1 } })
@@ -1379,8 +1321,7 @@ app.post(
         if (intent.status !== "succeeded") {
           return res.status(402).send({ message: "Payment not completed" });
         }
-        /* Amount must match what the course + coupon actually cost. */
-        if (Math.abs(intent.amount - Math.round(expectedFinal * 100)) > 1) {
+            if (Math.abs(intent.amount - Math.round(expectedFinal * 100)) > 1) {
           return res.status(402).send({ message: "Payment amount mismatch" });
         }
       } catch (err) {
@@ -1389,7 +1330,6 @@ app.post(
       }
     }
 
-    /* Revenue split recorded at sale time. */
     data.finalPrice = Math.round(expectedFinal * 100) / 100;
     data.discount = percentOff;
     data.instructorShare = Math.round(expectedFinal * INSTRUCTOR_SHARE * 100) / 100;
@@ -1397,7 +1337,6 @@ app.post(
 
     const result = await payment.insertOne(data);
 
-    /* Burn one use of the coupon on a successful verified sale. */
     if (coupon) {
       await couponCol.updateOne(
         { _id: coupon._id },
@@ -1431,7 +1370,6 @@ app.post(
 );
 
 // ---------------- lesson progress (LMS) ----------------
-// Shape stored on the user doc:  progress: { [courseId]: ["0","2",...] }
 
 app.get(
   "/progress/:email",
@@ -1447,7 +1385,6 @@ app.get(
   })
 );
 
-/** Full learning state incl. resume positions + active lesson per course. */
 app.get(
   "/progress/state/:email",
   verifyToken,
@@ -1497,8 +1434,6 @@ app.patch(
 
 // ---------------- misc ----------------
 
-/** Sitemap for search engines: static pages + every public course URL.
- *  Origin comes from the first entry of CLIENT_URL. */
 app.get(
   "/sitemap.xml",
   wrap(async (req, res) => {
